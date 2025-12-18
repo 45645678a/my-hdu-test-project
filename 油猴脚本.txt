@@ -1,0 +1,447 @@
+// ==UserScript==
+// @name         智慧课堂下载器 (V10.4)
+// @namespace    http://tampermonkey.net/
+// @version      10.4
+// @description  修复下载问题 + 新标签页跳转
+// @author       You
+// @match        *://*/*
+// @grant        GM_download
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_openInTab
+// @connect      *
+// @run-at       document-idle
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    const CONFIG = {
+        jumpDelay: 5000,      // 下载后等5秒再跳转
+        stableTime: 800,
+        detectInterval: 500,
+        openInNewTab: true    // 【新增】新标签页打开
+    };
+
+    const STATE = {
+        lastUrl: GM_getValue('lastDownloadedUrl', ''),
+        isPaused: false,
+        isBusy: false,
+        pendingTimer: null,
+        pendingUrl: '',
+        downloadCount: GM_getValue('downloadCount', 0)
+    };
+
+    // ================= UI =================
+    const panel = document.createElement('div');
+    panel.id = 'dl_panel';
+    const savedPos = GM_getValue('panelPosition', { left: window.innerWidth - 360, top: 80 });
+    panel.style.cssText = `
+        position: fixed; left: ${savedPos.left}px; top: ${savedPos.top}px; z-index: 2147483647;
+        background: rgba(10, 10, 10, 0.95); color: #0f0; width: 340px;
+        border: 2px solid #00ff00; border-radius: 10px; font-family: 'Consolas', monospace;
+        box-shadow: 0 0 20px rgba(0,255,0,0.3); font-size: 12px; user-select: none;
+    `;
+    panel.innerHTML = `
+        <div id="panel_header" style="padding:12px; background:linear-gradient(135deg,#1a1a2e,#16213e); border-bottom:1px solid #0f0; cursor:move; border-radius:8px 8px 0 0; font-weight:bold; font-size:14px;">
+            🎬 课程下载器 V10.4 <span id="ui_count" style="float:right; color:#0cc;">#0</span>
+        </div>
+        <div style="padding:12px;">
+            <div style="display:flex; justify-content:space-between; margin-bottom:8px;">
+                <span style="color:#888;">视频类型:</span>
+                <span id="ui_src_type" style="color:#0f0;">检测中...</span>
+            </div>
+            <div style="color:#888; margin-bottom:4px;">当前地址:</div>
+            <div id="ui_current_src" style="color:#fff; background:#222; padding:6px; margin-bottom:10px; border-radius:4px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-size:10px;">等待...</div>
+
+            <div style="display:flex; justify-content:space-between; margin-bottom:8px;">
+                <span style="color:#888;">状态:</span>
+                <span id="ui_status" style="color:#0cc; font-weight:bold;">⏳ 就绪</span>
+            </div>
+
+            <div style="display:grid; grid-template-columns:1fr 1fr; gap:6px; margin-bottom:8px;">
+                <button id="btn_toggle" class="dl-btn" style="background:#28a745;">⏸ 暂停</button>
+                <button id="btn_skip" class="dl-btn" style="background:#ffc107; color:#000;">⏭ 下一节</button>
+                <button id="btn_force" class="dl-btn" style="background:#d63384;">⬇️ 立即下载</button>
+                <button id="btn_open" class="dl-btn" style="background:#0d6efd;">🔗 打开视频</button>
+            </div>
+            <button id="btn_clear" class="dl-btn" style="width:100%; background:#6c757d;">🗑️ 清除记录（重新开始）</button>
+
+            <details style="margin-top:10px;" open>
+                <summary style="color:#888; cursor:pointer;">📋 调试日志</summary>
+                <div id="ui_log" style="color:#aaa; background:#111; padding:6px; margin-top:6px; height:100px; overflow-y:auto; font-size:11px; border-radius:4px; line-height:1.4;"></div>
+            </details>
+        </div>
+        <style>
+            .dl-btn { padding:10px 8px; cursor:pointer; color:#fff; border:none; border-radius:5px; font-size:12px; font-weight:bold; transition: all 0.2s; }
+            .dl-btn:hover { filter: brightness(1.2); transform: scale(1.02); }
+            .dl-btn:active { transform: scale(0.98); }
+        </style>
+    `;
+    document.body.appendChild(panel);
+
+    const ui = {
+        srcType: document.getElementById('ui_src_type'),
+        src: document.getElementById('ui_current_src'),
+        status: document.getElementById('ui_status'),
+        log: document.getElementById('ui_log'),
+        count: document.getElementById('ui_count'),
+        btnToggle: document.getElementById('btn_toggle'),
+        btnSkip: document.getElementById('btn_skip'),
+        btnForce: document.getElementById('btn_force'),
+        btnOpen: document.getElementById('btn_open'),
+        btnClear: document.getElementById('btn_clear')
+    };
+
+    ui.count.innerText = `#${STATE.downloadCount}`;
+
+    function log(msg, color = '#aaa') {
+        const time = new Date().toLocaleTimeString();
+        ui.log.innerHTML = `<div style="color:${color}">[${time}] ${msg}</div>` + ui.log.innerHTML;
+        console.log(`[DL] ${msg}`);
+    }
+
+    function updateStatus(text, color = '#fff') {
+        ui.status.innerText = text;
+        ui.status.style.color = color;
+    }
+
+    // ================= 拖拽 =================
+    const header = document.getElementById('panel_header');
+    let isDragging = false, offsetX, offsetY;
+
+    header.addEventListener('mousedown', (e) => {
+        if (e.target.tagName === 'BUTTON' || e.target.tagName === 'SPAN') return;
+        isDragging = true;
+        offsetX = e.clientX - panel.getBoundingClientRect().left;
+        offsetY = e.clientY - panel.getBoundingClientRect().top;
+        panel.style.opacity = '0.85';
+        e.preventDefault();
+    });
+
+    document.addEventListener('mousemove', (e) => {
+        if (!isDragging) return;
+        panel.style.left = Math.max(0, e.clientX - offsetX) + 'px';
+        panel.style.top = Math.max(0, e.clientY - offsetY) + 'px';
+    });
+
+    document.addEventListener('mouseup', () => {
+        if (isDragging) {
+            isDragging = false;
+            panel.style.opacity = '1';
+            GM_setValue('panelPosition', {
+                left: parseInt(panel.style.left),
+                top: parseInt(panel.style.top)
+            });
+        }
+    });
+
+    // ================= 按钮事件 =================
+    ui.btnToggle.onclick = () => {
+        STATE.isPaused = !STATE.isPaused;
+        ui.btnToggle.innerText = STATE.isPaused ? "▶ 恢复" : "⏸ 暂停";
+        ui.btnToggle.style.background = STATE.isPaused ? "#6c757d" : "#28a745";
+        updateStatus(STATE.isPaused ? "⛔ 已暂停" : "✅ 运行中", STATE.isPaused ? "#f55" : "#0f0");
+        log(STATE.isPaused ? "已暂停" : "已恢复", STATE.isPaused ? "#f55" : "#0f0");
+    };
+
+    ui.btnSkip.onclick = () => {
+        STATE.isBusy = false;
+        STATE.pendingUrl = '';
+        log("手动跳转下一节", "#ffc107");
+        jumpToNext();
+    };
+
+    ui.btnForce.onclick = () => {
+        const video = findVideo();
+        const src = getVideoSrc(video);
+        if (src) {
+            log("手动强制下载", "#d63384");
+            startDownload(src, true);
+        } else {
+            updateStatus("❌ 无视频", "#f55");
+            log("找不到视频源", "#f55");
+        }
+    };
+
+    ui.btnOpen.onclick = () => {
+        const video = findVideo();
+        const src = getVideoSrc(video);
+        if (src && !src.startsWith('blob:')) {
+            window.open(src, '_blank');
+            log("已在新窗口打开视频", "#0d6efd");
+        } else {
+            updateStatus("❌ 无法打开", "#f55");
+        }
+    };
+
+    ui.btnClear.onclick = () => {
+        STATE.lastUrl = '';
+        STATE.pendingUrl = '';
+        STATE.downloadCount = 0;
+        GM_setValue('lastDownloadedUrl', '');
+        GM_setValue('downloadCount', 0);
+        ui.count.innerText = '#0';
+        updateStatus("🗑️ 已清除", "#0f0");
+        log("记录已清除", "#0f0");
+    };
+
+    // ================= 查找视频 =================
+    function findVideo() {
+        // 主文档
+        let video = document.querySelector('video');
+        if (video) return video;
+
+        // iframe
+        try {
+            const iframes = document.querySelectorAll('iframe');
+            for (const iframe of iframes) {
+                const v = iframe.contentDocument?.querySelector('video');
+                if (v) return v;
+            }
+        } catch (e) {}
+
+        return null;
+    }
+
+    function getVideoSrc(video) {
+        if (!video) return '';
+        if (video.src && video.src.startsWith('http')) return video.src;
+        const source = video.querySelector('source');
+        if (source?.src) return source.src;
+        return video.currentSrc || '';
+    }
+
+    // ================= 生成文件名 =================
+    function generateFileName() {
+        let name = '';
+
+        const activeItem = document.querySelector('.body-item.active, .video-item.active, .list-item.active');
+        if (activeItem) {
+            name = activeItem.innerText.split('\n')[0].trim();
+        }
+
+        if (!name) {
+            name = document.title.replace(/智慧课堂|在线|播放|视频|-|_/g, ' ').trim();
+        }
+
+        if (!name) name = 'video_' + Date.now();
+
+        name = name.replace(/[\\/:*?"<>|]/g, '').replace(/\s+/g, '_').substring(0, 60);
+        if (!name.toLowerCase().endsWith('.mp4')) name += '.mp4';
+
+        return name;
+    }
+
+    // ================= 【核心】下载函数 =================
+    function startDownload(url, force = false) {
+        if (!url) {
+            log("URL为空，跳过", "#f55");
+            return;
+        }
+
+        if (url.startsWith('blob:')) {
+            log("Blob格式不支持", "#fa0");
+            updateStatus("⚠️ Blob不支持", "#fa0");
+            return;
+        }
+
+        if (!force && url === STATE.lastUrl) {
+            log("重复地址，跳过", "#888");
+            updateStatus("⏭ 已下载过", "#fa0");
+            return;
+        }
+
+        STATE.isBusy = true;
+        STATE.lastUrl = url;
+        STATE.pendingUrl = '';
+        GM_setValue('lastDownloadedUrl', url);
+
+        const fileName = generateFileName();
+        log(`开始下载: ${fileName}`, '#d63384');
+        updateStatus(`⬇️ 下载中...`, "#d63384");
+
+        // 【关键】使用 GM_download，这个更可靠
+        try {
+            GM_download({
+                url: url,
+                name: fileName,
+                saveAs: false,
+                onerror: (err) => {
+                    log(`GM_download 错误: ${err.error}`, '#f55');
+                    // 备用方案
+                    fallbackDownload(url, fileName);
+                },
+                onload: () => {
+                    log(`下载已完成: ${fileName}`, '#0f0');
+                },
+                ontimeout: () => {
+                    log('下载超时，尝试备用方案', '#fa0');
+                    fallbackDownload(url, fileName);
+                }
+            });
+
+            // 更新计数
+            STATE.downloadCount++;
+            GM_setValue('downloadCount', STATE.downloadCount);
+            ui.count.innerText = `#${STATE.downloadCount}`;
+
+            log("GM_download 已触发", "#0f0");
+
+        } catch (e) {
+            log(`下载异常: ${e.message}`, '#f55');
+            fallbackDownload(url, fileName);
+        }
+
+        // 自动跳转到下一节
+        if (!STATE.isPaused) {
+            log(`${CONFIG.jumpDelay/1000}秒后跳转下一节...`, '#0cc');
+            setTimeout(() => {
+                updateStatus("⏳ 跳转中...", "#0cc");
+                jumpToNext();
+            }, CONFIG.jumpDelay);
+        } else {
+            STATE.isBusy = false;
+        }
+    }
+
+    // 备用下载方案
+    function fallbackDownload(url, fileName) {
+        log("使用备用下载方案", "#fa0");
+
+        // 方案1: 创建隐藏 iframe 下载
+        const iframe = document.createElement('iframe');
+        iframe.style.display = 'none';
+        iframe.src = url;
+        document.body.appendChild(iframe);
+
+        // 方案2: 同时尝试 a 标签
+        setTimeout(() => {
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = fileName;
+            a.target = '_blank';
+            a.rel = 'noopener';
+            document.body.appendChild(a);
+            a.click();
+            setTimeout(() => a.remove(), 500);
+        }, 500);
+
+        setTimeout(() => iframe.remove(), 3000);
+    }
+
+    // ================= 【修改】跳转下一节 - 新标签页 =================
+    function jumpToNext() {
+        const activeItem = document.querySelector('.body-item.active');
+
+        if (!activeItem) {
+            log("找不到当前课程项", "#f55");
+            updateStatus("❌ 找不到当前项", "#f55");
+            STATE.isBusy = false;
+            return;
+        }
+
+        // 找下一个 body-item
+        let nextItem = activeItem.nextElementSibling;
+        while (nextItem && !nextItem.classList.contains('body-item')) {
+            nextItem = nextItem.nextElementSibling;
+        }
+
+        if (nextItem) {
+            log("找到下一节，准备跳转", "#0cc");
+
+            if (CONFIG.openInNewTab) {
+                // 【新标签页方式】
+                // 尝试获取下一节的链接
+                const link = nextItem.querySelector('a');
+                if (link && link.href) {
+                    log(`新标签页打开: ${link.href.slice(-30)}`, "#0cc");
+                    GM_openInTab(link.href, { active: true });
+                    updateStatus("✅ 已在新标签页打开", "#0f0");
+                } else {
+                    // 没有链接，尝试点击后获取URL变化
+                    log("无直接链接，尝试点击方式", "#fa0");
+                    clickAndNavigate(nextItem);
+                }
+            } else {
+                // 当前页面跳转
+                clickAndNavigate(nextItem);
+            }
+        } else {
+            log("没有更多课程了", "#f0f");
+            updateStatus("🎉 全部完成!", "#f0f");
+            STATE.isBusy = false;
+        }
+    }
+
+    function clickAndNavigate(item) {
+        item.scrollIntoView({ behavior: "smooth", block: "center" });
+
+        setTimeout(() => {
+            // 点击元素
+            item.click();
+
+            // 尝试点击内部可点击元素
+            const inner = item.querySelector('.left-box, a, [class*="title"]');
+            if (inner) {
+                inner.click();
+            }
+
+            updateStatus("✅ 已跳转", "#0f0");
+            log("点击跳转成功", "#0f0");
+
+            setTimeout(() => {
+                STATE.isBusy = false;
+            }, 2000);
+        }, 300);
+    }
+
+    // ================= 主检测循环 =================
+    setInterval(() => {
+        const video = findVideo();
+        const currentSrc = getVideoSrc(video);
+
+        if (currentSrc && currentSrc.startsWith('http')) {
+            // UI 更新
+            ui.srcType.innerText = currentSrc.includes('webvpn') ? "✅ WebVPN" : "✅ HTTP";
+            ui.srcType.style.color = "#0f0";
+            ui.src.innerText = "..." + currentSrc.slice(-50);
+            ui.src.title = currentSrc;
+
+            if (STATE.isPaused || STATE.isBusy) return;
+
+            // 检测新视频
+            if (currentSrc !== STATE.lastUrl && currentSrc !== STATE.pendingUrl) {
+                STATE.pendingUrl = currentSrc;
+                updateStatus("👀 检测到新视频", "#ff0");
+                log("发现新视频源", "#ff0");
+
+                clearTimeout(STATE.pendingTimer);
+                STATE.pendingTimer = setTimeout(() => {
+                    const nowSrc = getVideoSrc(findVideo());
+                    if (nowSrc === currentSrc && currentSrc !== STATE.lastUrl) {
+                        log("视频源稳定，开始下载", "#0f0");
+                        startDownload(currentSrc);
+                    }
+                }, CONFIG.stableTime);
+            }
+        } else if (currentSrc?.startsWith('blob:')) {
+            ui.srcType.innerText = "⚠️ Blob";
+            ui.srcType.style.color = "#fa0";
+            ui.src.innerText = "Blob格式 (不支持)";
+        } else {
+            ui.srcType.innerText = "❓ 无视频";
+            ui.srcType.style.color = "#888";
+            ui.src.innerText = "等待视频加载...";
+        }
+    }, CONFIG.detectInterval);
+
+    // 启动
+    log("=== 脚本启动 V10.4 ===", "#0f0");
+    log(`已下载 ${STATE.downloadCount} 个视频`, "#0cc");
+    if (STATE.lastUrl) {
+        log("上次: ..." + STATE.lastUrl.slice(-35), "#888");
+    }
+    updateStatus("✅ 就绪，等待视频", "#0f0");
+
+})();
